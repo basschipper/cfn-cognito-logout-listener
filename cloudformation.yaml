@@ -1,0 +1,398 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Cognito Logout Listener Example
+Parameters:
+  VpcId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::VPC::Id>
+    Default: /vendor/landing-zone/vpc/vpc-id
+  PrivateSubnet1Id:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+    Default: /vendor/landing-zone/vpc/private-subnet-1-id
+  PrivateSubnet2Id:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+    Default: /vendor/landing-zone/vpc/private-subnet-2-id
+  PrivateSubnet3Id:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Subnet::Id>
+    Default: /vendor/landing-zone/vpc/private-subnet-3-id
+
+  PrivateHostedZoneName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /vendor/landing-zone/dns/private/prd/hosted-zone-name
+  PrivateHostedZoneId:
+    Type: AWS::SSM::Parameter::Value<AWS::Route53::HostedZone::Id>
+    Default: /vendor/landing-zone/dns/private/prd/hosted-zone-id
+  PublicHostedZoneId:
+    Type: AWS::SSM::Parameter::Value<AWS::Route53::HostedZone::Id>
+    Default: /vendor/landing-zone/dns/public/prd/hosted-zone-id
+  EcsClusterArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /vendor/landing-zone/ecs/arn
+
+  CognitoUserPoolArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /vendor/landing-zone/elasticsearch-cognito/user-pool-arn
+  CognitoUserPoolId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /vendor/landing-zone/elasticsearch-cognito/user-pool-id
+  CognitoUserPoolDomain:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /vendor/landing-zone/elasticsearch-cognito/user-pool-domain
+
+Resources:
+
+#
+# Load balancer
+#
+
+  AppLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MyApp load balancer
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: myapp-load-balancer
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      SecurityGroups:
+        - !Ref AppLoadBalancerSecurityGroup
+      Subnets:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+        - !Ref PrivateSubnet3Id
+      Tags:
+        - Key: Name
+          Value: myapp
+
+  AppLoadBalancerHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: authenticate-cognito
+          AuthenticateCognitoConfig:
+            OnUnauthenticatedRequest: authenticate
+            Scope: openid
+            UserPoolArn: !Ref CognitoUserPoolArn
+            UserPoolClientId: !Ref CognitoUserPoolClient
+            UserPoolDomain: !Ref CognitoUserPoolDomain
+          Order: 1
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+          Order: 2
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+
+  AppLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - RedirectConfig:
+            Host: "#{host}"
+            Path: "/#{path}"
+            Port: "443"
+            Protocol: "HTTPS"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+          Type: redirect
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+#
+# App Service
+#
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/vendor/ecs/task/myapp'
+      RetentionInDays: 7
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MyApp
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref AppLoadBalancerSecurityGroup
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: myapp
+
+  AppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: myapp
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: myapp
+      Cpu: 512
+      Memory: 2048
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt AppTaskRole.Arn
+      TaskRoleArn: !GetAtt AppTaskRole.Arn
+      ContainerDefinitions:
+        - Name: nginx
+          Image: nginx:1.19.2
+          Essential: true
+          Environment:
+            - Name: NGINX_PORT
+              Value: 8080
+          PortMappings:
+            - HostPort: 8080
+              ContainerPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: myapp
+      Tags:
+        - Key: Name
+          Value: myapp
+
+  AppService:
+    Type: AWS::ECS::Service
+    DependsOn: AppLoadBalancerHttpsListener
+    Properties:
+      Cluster: !Ref EcsClusterArn
+      DesiredCount: 1
+      TaskDefinition: !Ref AppTaskDefinition
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      LoadBalancers:
+        - ContainerName: myapp
+          ContainerPort: 8080
+          TargetGroupArn: !Ref AppTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref AppSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1Id
+            - !Ref PrivateSubnet2Id
+            - !Ref PrivateSubnet3Id
+      Tags:
+        - Key: Name
+          Value: myapp
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      TargetType: ip
+      Port: 8080
+      Protocol: HTTP
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: myapp
+
+#
+# Cognito Logout
+#
+
+  CognitoLogoutLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import urllib
+
+          location = "https://{}.auth.{}.amazoncognito.com/logout?client_id={}&redirect_uri={}&response_type=code&state=STATE&scope=openid".format(
+              os.environ.get("USER_POOL_DOMAIN"),
+              os.environ.get("REGION"),
+              os.environ.get("USER_POOL_CLIENT"),
+              urllib.parse.quote(os.environ.get("REDIRECT_URI"))
+          )
+
+          def send_response(event):
+              return({
+                  "isBase64Encoded": False,
+                  "statusCode": 302,
+                  "statusDescription": "Found",
+                  "headers": {
+                      "content-type": "content-type: text/html; charset=utf-8",
+                      "set-cookie": "AWSELBAuthSessionCookie-0=empty;max_age=-3600",
+                      "location": location
+                  }
+              })
+
+          def handler(event, context):
+              return(send_response(event))
+      Description: Invalidate the session cookie
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          USER_POOL_DOMAIN: !Ref CognitoUserPoolDomain
+          USER_POOL_CLIENT: !Ref CognitoUserPoolClient
+          REDIRECT_URI: !Sub 'https://${SubDomain}.${PrivateHostedZoneName}/'
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt CognitoLogoutLambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt CognitoLogoutLambdaSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+          - !Ref PrivateSubnet3Id
+      Tags:
+        - Key: Name
+          Value: myapp-cognito-logout
+
+  CognitoLogoutLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CognitoLogoutLambda}'
+      RetentionInDays: 7
+
+  CognitoLogoutLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Security group for Cognito Logout Lambda
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref AppLoadBalancerSecurityGroup
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+      Tags:
+        - Key: Name
+          Value: myapp-cognito-logout
+
+  CognitoLogoutLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags:
+        - Key: Name
+          Value: myapp-cognito-logout
+
+  CognitoLogoutTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt CognitoLogoutLambda.Arn
+
+  CognitoLogoutListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref CognitoLogoutTargetGroup
+          Type: 'forward'
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/destroy'
+      ListenerArn: !Ref AppLoadBalancerHttpsListener
+      Priority: 100
+
+  CognitoLogoutLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CognitoLogoutLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+
+#
+# Misc
+#
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - aws.cognito.signin.user.admin
+      CallbackURLs:
+        - !Sub 'https://${SubDomain}.${PrivateHostedZoneName}/'
+        - !Sub 'https://${SubDomain}.${PrivateHostedZoneName}/oauth2/idpresponse'
+      GenerateSecret: true
+      SupportedIdentityProviders:
+        - COGNITO
+      UserPoolId: !Ref CognitoUserPoolId
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZoneId
+      Name: !Sub '${SubDomain}.${PrivateHostedZoneName}.'
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt 'AppLoadBalancer.CanonicalHostedZoneID'
+        DNSName: !GetAtt 'AppLoadBalancer.DNSName'
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub '${SubDomain}.${PrivateHostedZoneName}'
+      DomainValidationOptions:
+        - DomainName: !Sub '${SubDomain}.${PrivateHostedZoneName}'
+          HostedZoneId: !Ref PublicHostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: myapp
